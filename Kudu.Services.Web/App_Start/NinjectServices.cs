@@ -10,6 +10,7 @@ using System.Web;
 using System.Web.Http;
 using System.Web.Routing;
 using Kudu.Contracts.Infrastructure;
+using Kudu.Contracts.Jobs;
 using Kudu.Contracts.Settings;
 using Kudu.Contracts.SourceControl;
 using Kudu.Contracts.Tracing;
@@ -19,6 +20,7 @@ using Kudu.Core.Deployment;
 using Kudu.Core.Deployment.Generator;
 using Kudu.Core.Hooks;
 using Kudu.Core.Infrastructure;
+using Kudu.Core.Jobs;
 using Kudu.Core.Settings;
 using Kudu.Core.SourceControl;
 using Kudu.Core.SourceControl.Git;
@@ -196,6 +198,9 @@ namespace Kudu.Services.Web.App_Start
             kernel.Bind<IWebHooksManager>().To<WebHooksManager>()
                                              .InRequestScope();
 
+            kernel.Bind<IJobsManager>().To<JobsManager>()
+                                             .InRequestScope();
+
             kernel.Bind<ILogger>().ToMethod(context => GetLogger(environment, context.Kernel))
                                              .InRequestScope();
 
@@ -344,6 +349,9 @@ namespace Kudu.Services.Web.App_Start
             routes.MapHttpRoute("publish-hooks", "hooks/publish/{hookEventType}", new { controller = "WebHooks", action = "PublishEvent" }, new { verb = new HttpMethodConstraint("POST") });
             routes.MapHttpRoute("get-hooks", "hooks", new { controller = "WebHooks", action = "GetWebHooks" }, new { verb = new HttpMethodConstraint("GET") });
             routes.MapHttpRoute("subscribe-hook", "hooks", new { controller = "WebHooks", action = "Subscribe" }, new { verb = new HttpMethodConstraint("POST") });
+
+            // Jobs
+            routes.MapHttpRoute("get-always-on-jobs", "jobs/alwaysOn", new { controller = "Jobs", action = "GetAlwaysOnJobs" }, new { verb = new HttpMethodConstraint("GET") });
         }
 
         // Perform migration tasks to deal with legacy sites that had different file layout

@@ -93,5 +93,35 @@ namespace Kudu.TestHarness
             get;
             set;
         }
+
+        public string DataPath
+        {
+            get;
+            set;
+        }
+
+        public string AlwaysOnJobsDataPath
+        {
+            get;
+            set;
+        }
+
+        public string TriggeredJobsDataPath
+        {
+            get;
+            set;
+        }
+
+        public System.Collections.Generic.IEnumerable<string> AlwaysOnJobsPaths
+        {
+            get;
+            set;
+        }
+
+        public System.Collections.Generic.IEnumerable<string> TriggeredJobsPaths
+        {
+            get;
+            set;
+        }
     }
 }

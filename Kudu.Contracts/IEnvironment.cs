@@ -1,4 +1,6 @@
-﻿namespace Kudu.Core
+﻿using System.Collections.Generic;
+
+namespace Kudu.Core
 {
     public interface IEnvironment
     {
@@ -17,5 +19,11 @@
         string TracePath { get; }               // e.g. /logfiles/git/trace
         string AnalyticsPath { get; }           // e.g. %temp%/siteExtLogs
         string DeploymentTracePath { get; }     // e.g. /logfiles/git/deployment
+        string DataPath { get; }                // e.g. /data
+        string AlwaysOnJobsDataPath { get; }    // e.g. /data/jobs/alwaysOn
+        string TriggeredJobsDataPath { get; }    // e.g. /data/jobs/alwaysOn
+
+        IEnumerable<string> AlwaysOnJobsPaths { get; }     // e.g. /site/wwwroot/app_data/jobs/alwaysOn  ; /site/jobs/alwaysOn
+        IEnumerable<string> TriggeredJobsPaths { get; }    // e.g. /site/wwwroot/app_data/jobs/triggered ; /site/jobs/triggered
     }
 }
