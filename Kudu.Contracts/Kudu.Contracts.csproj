@@ -58,7 +58,7 @@
     <Compile Include="Infrastructure\RS.cs" />
     <Compile Include="Infrastructure\StringUtils.cs" />
     <Compile Include="Jobs\IJobsManager.cs" />
-    <Compile Include="Jobs\Job.cs" />
+    <Compile Include="Jobs\JobBase.cs" />
     <Compile Include="Jobs\JobStatus.cs" />
     <Compile Include="Settings\ISettingsProvider.cs" />
     <Compile Include="Settings\DeploymentSettingsExtension.cs" />

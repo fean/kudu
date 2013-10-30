@@ -1,8 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Kudu.Contracts.Jobs;
 using Kudu.Contracts.Tracing;
 using Kudu.Core.Infrastructure;
@@ -17,6 +22,7 @@ namespace Kudu.Core.Jobs
         private static readonly ScriptHostBase[] ScriptHosts = new ScriptHostBase[]
         {
             new WindowsScriptHost(),
+            new BashScriptHost(),
             new PythonScriptHost(),
             new PhpScriptHost(),
             new NodeScriptHost()
@@ -35,44 +41,75 @@ namespace Kudu.Core.Jobs
 
         public IEnumerable<AlwaysOnJob> ListAlwaysOnJobs()
         {
-            var alwaysOnJobs = new List<AlwaysOnJob>();
+            return ListJobs(_environment.AlwaysOnJobsPaths, BuildAlwaysOnJob);
+        }
 
-            foreach (string alwaysOnJobsPath in _environment.AlwaysOnJobsPaths)
+        public IEnumerable<TriggeredJob> ListTriggeredJobs()
+        {
+            return ListJobs(_environment.TriggeredJobsPaths, BuildTriggeredJob);
+        }
+
+        public async Task InvokeTriggeredJob(string name)
+        {
+        }
+
+        private IEnumerable<TJob> ListJobs<TJob>(IEnumerable<string> jobsPaths, Func<DirectoryInfoBase, TJob> buildJobFunc) where TJob : JobBase, new()
+        {
+            var jobs = new List<TJob>();
+
+            foreach (string jobsPath in jobsPaths)
             {
-                if (!_fileSystem.Directory.Exists(alwaysOnJobsPath))
+                if (!_fileSystem.Directory.Exists(jobsPath))
                 {
                     continue;
                 }
 
-                DirectoryInfoBase alwaysOnJobsDirectory = _fileSystem.DirectoryInfo.FromDirectoryName(alwaysOnJobsPath);
-                DirectoryInfoBase[] jobDirectories = alwaysOnJobsDirectory.GetDirectories("*", SearchOption.TopDirectoryOnly);
+                DirectoryInfoBase jobsDirectory = _fileSystem.DirectoryInfo.FromDirectoryName(jobsPath);
+                DirectoryInfoBase[] jobDirectories = jobsDirectory.GetDirectories("*", SearchOption.TopDirectoryOnly);
                 foreach (DirectoryInfoBase jobDirectory in jobDirectories)
                 {
-                    AlwaysOnJob alwaysOnJob = BuildAlwaysOnJob(jobDirectory);
-                    if (alwaysOnJob != null)
+                    TJob job = buildJobFunc(jobDirectory);
+                    if (job != null)
                     {
-                        alwaysOnJobs.Add(alwaysOnJob);
+                        jobs.Add(job);
                     }
                 }
             }
 
-            return alwaysOnJobs;
+            return jobs;
+        }
+
+        private TriggeredJob BuildTriggeredJob(DirectoryInfoBase jobDirectory)
+        {
+            return BuildJob<TriggeredJob>(jobDirectory);
         }
 
         private AlwaysOnJob BuildAlwaysOnJob(DirectoryInfoBase jobDirectory)
         {
+            return BuildJob<AlwaysOnJob>(jobDirectory);
+        }
+
+        private TJob BuildJob<TJob>(DirectoryInfoBase jobDirectory) where TJob : JobBase, new()
+        {
             string jobName = jobDirectory.Name;
             FileInfoBase[] files = jobDirectory.GetFiles("*.*", SearchOption.TopDirectoryOnly);
-            string runCommand = FindCommandToRun(files);
+            IScriptHost scriptHost;
+            string runCommand = FindCommandToRun(files, out scriptHost);
 
-            return new AlwaysOnJob()
+            if (runCommand == null)
+            {
+                return null;
+            }
+
+            return new TJob()
             {
                 Name = jobName,
-                RunCommand = runCommand
+                ScriptFilePath = runCommand,
+                ScriptHost = scriptHost
             };
         }
 
-        private string FindCommandToRun(FileInfoBase[] files)
+        private string FindCommandToRun(FileInfoBase[] files, out IScriptHost scriptHostFound)
         {
             foreach (ScriptHostBase scriptHost in ScriptHosts)
             {
@@ -83,23 +120,188 @@ namespace Kudu.Core.Jobs
                     {
                         var scriptFound = supportedFiles.FirstOrDefault(f => String.Equals(f.Name, DefaultScriptFileName, StringComparison.OrdinalIgnoreCase));
                         var supportedFile = scriptFound ?? supportedFiles.First();
+                        scriptHostFound = scriptHost;
                         return supportedFile.FullName;
                     }
                 }
             }
 
+            scriptHostFound = null;
+
             return null;
+        }
+
+        public class TriggeredJobRunner
+        {
+            private const string JobEnvironmentKeyPrefix = "WEBSITE_JOB_RUNNING_";
+
+            private readonly IEnvironment _environment;
+            private readonly IFileSystem _fileSystem;
+
+            private string _jobBinariesPath;
+            private string _workingDirectory;
+            private string _tempJobPath;
+            private int _lastHash;
+            private object _cacheLock = new object();
+
+            public TriggeredJob Job { get; private set; }
+
+            public TriggeredJobRunner(TriggeredJob job, IEnvironment environment, IFileSystem fileSystem)
+            {
+                _environment = environment;
+                _fileSystem = fileSystem;
+
+                Job = job;
+
+                _jobBinariesPath = Path.GetDirectoryName(Job.ScriptFilePath);
+                _tempJobPath = Path.Combine(_environment.TempPath, Constants.TriggeredPath, Job.Name);
+
+                if (!_fileSystem.File.Exists(Job.ScriptFilePath))
+                {
+                    //Status = "Missing run_worker.cmd file";
+                    //Trace.TraceError(Status);
+                    //return;
+                }
+            }
+
+            private int CalculateHashForJob()
+            {
+                var updateDatesString = new StringBuilder();
+                DirectoryInfoBase jobBinariesDirectory = _fileSystem.DirectoryInfo.FromDirectoryName(_jobBinariesPath);
+                FileInfoBase[] files = jobBinariesDirectory.GetFiles("*.*", SearchOption.AllDirectories);
+                foreach (FileInfoBase file in files)
+                {
+                    updateDatesString.Append(file.LastWriteTimeUtc.Ticks);
+                }
+
+                return updateDatesString.ToString().GetHashCode();
+            }
+
+            private void CacheJobBinaries(ITracer tracer)
+            {
+                lock (_cacheLock)
+                {
+                    var currentHash = CalculateHashForJob();
+
+                    if (_lastHash == currentHash)
+                    {
+                        return;
+                    }
+
+                    SafeKillAllRunningJobInstances(tracer);
+
+                    if (_fileSystem.Directory.Exists(_tempJobPath))
+                    {
+                        FileSystemHelpers.DeleteDirectoryContentsSafe(_tempJobPath, true);
+                    }
+
+                    if (_fileSystem.Directory.Exists(_tempJobPath))
+                    {
+                        tracer.TraceWarning("Failed to delete temporary directory");
+                    }
+
+                    try
+                    {
+                        var tempJobInstancePath = Path.Combine(_tempJobPath, Path.GetRandomFileName());
+
+                        FileSystemHelpers.CopyDirectoryRecursive(_fileSystem, _jobBinariesPath, tempJobInstancePath);
+
+                        _workingDirectory = tempJobInstancePath;
+
+                        _lastHash = currentHash;
+                    }
+                    catch (Exception ex)
+                    {
+                        //Status = "Worker is not running due to an error";
+                        //TraceError("Failed to copy bin directory: " + ex);
+                        tracer.TraceError("Failed to copy job files: " + ex);
+
+                        // job disabled
+                        _workingDirectory = null;
+                    }
+                }
+            }
+
+            public string GetJobEnvironmentKey()
+            {
+                return JobEnvironmentKeyPrefix + Job.Name;
+            }
+
+            public async Task RunJobInstance(ITracer tracer)
+            {
+                // TODO: Use actual async code
+                await Task.Factory.StartNew(() =>
+                {
+                    CacheJobBinaries(tracer);
+
+                    if (_workingDirectory == null)
+                    {
+                        return;
+                    }
+
+                    using (tracer.Step("Run script '{0}' with script host - '{1}'".FormatCurrentCulture(Job.ScriptFilePath, Job.ScriptHost.GetType())))
+                    {
+                        try
+                        {
+                            var exe = new Executable(Job.ScriptHost.HostPath, _workingDirectory, TimeSpan.MaxValue);
+                            exe.EnvironmentVariables[GetJobEnvironmentKey()] = "true";
+                            exe.ExecuteWithoutIdleManager(tracer, (message) => tracer.Trace(message), tracer.TraceError, TimeSpan.MaxValue,
+                                                            Job.ScriptHost.ArgumentsFormat, Job.ScriptFilePath);
+                        }
+                        catch (Exception ex)
+                        {
+                            tracer.TraceError(ex);
+                        }
+                    }
+                });
+            }
+
+            public void SafeKillAllRunningJobInstances(ITracer tracer)
+            {
+                try
+                {
+                    Process[] processes = Process.GetProcesses();
+                    foreach (Process process in processes)
+                    {
+                        StringDictionary processEnvironment = ProcessEnvironment.TryGetEnvironmentVariables(process);
+                        if (processEnvironment != null && processEnvironment.ContainsKey(GetJobEnvironmentKey()))
+                        {
+                            try
+                            {
+                                process.Kill();
+                            }
+                            catch (Exception ex)
+                            {
+                                if (!process.HasExited)
+                                {
+                                    tracer.TraceError("Failed to kill process - {0} for job - {1}\n{2}".FormatInvariant(process.ProcessName, Job.Name,
+                                                                                                                        ex));
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    tracer.TraceError(ex);
+                }
+            }
         }
     }
 
-    public abstract class ScriptHostBase
+    public abstract class ScriptHostBase : IScriptHost
     {
-        protected ScriptHostBase(string hostPath)
+        private const string JobEnvironmentKey = "WEBSITE_JOB_RUNNING";
+
+        protected ScriptHostBase(string hostPath, string argumentsFormat = "{0}")
         {
-            this.HostPath = hostPath;
+            HostPath = hostPath;
+            ArgumentsFormat = argumentsFormat;
         }
 
         public string HostPath { get; private set; }
+
+        public string ArgumentsFormat { get; private set; }
 
         public virtual bool IsSupported
         {
@@ -107,6 +309,23 @@ namespace Kudu.Core.Jobs
         }
 
         public abstract IEnumerable<string> SupportedExtensions { get; }
+
+        public void RunScript(ITracer tracer, string scriptFileName, string workingDirectory, Action<string> onWriteOutput, Action<string> onWriteError, TimeSpan timeout)
+        {
+            using (tracer.Step("Run script '{0}' with script host - '{1}'".FormatCurrentCulture(scriptFileName, GetType())))
+            {
+                try
+                {
+                    var exe = new Executable(HostPath, workingDirectory, TimeSpan.MaxValue);
+                    exe.EnvironmentVariables[JobEnvironmentKey] = "true";
+                    exe.ExecuteWithoutIdleManager(tracer, onWriteOutput, onWriteError, timeout, ArgumentsFormat, scriptFileName);
+                }
+                catch (Exception ex)
+                {
+                    tracer.TraceError(ex);
+                }
+            }
+        }
     }
 
     public class WindowsScriptHost : ScriptHostBase
@@ -114,7 +333,7 @@ namespace Kudu.Core.Jobs
         private static readonly string[] Supported = { ".cmd", ".bat", ".exe" };
 
         public WindowsScriptHost()
-            : base("cmd")
+            : base("cmd", "/c {0}")
         {
         }
 
@@ -136,6 +355,21 @@ namespace Kudu.Core.Jobs
         private static string DiscoverHostPath()
         {
             return PathUtility.ResolveNodePath();
+        }
+
+        public override IEnumerable<string> SupportedExtensions
+        {
+            get { return Supported; }
+        }
+    }
+
+    public class BashScriptHost : ScriptHostBase
+    {
+        private static readonly string[] Supported = { ".sh" };
+
+        public BashScriptHost()
+            : base("bash")
+        {
         }
 
         public override IEnumerable<string> SupportedExtensions

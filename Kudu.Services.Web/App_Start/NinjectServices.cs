@@ -351,7 +351,9 @@ namespace Kudu.Services.Web.App_Start
             routes.MapHttpRoute("subscribe-hook", "hooks", new { controller = "WebHooks", action = "Subscribe" }, new { verb = new HttpMethodConstraint("POST") });
 
             // Jobs
+            routes.MapHttpRoute("get-all-jobs", "jobs", new { controller = "Jobs", action = "GetAllJobs" }, new { verb = new HttpMethodConstraint("GET") });
             routes.MapHttpRoute("get-always-on-jobs", "jobs/alwaysOn", new { controller = "Jobs", action = "GetAlwaysOnJobs" }, new { verb = new HttpMethodConstraint("GET") });
+            routes.MapHttpRoute("get-triggered-jobs", "jobs/triggered", new { controller = "Jobs", action = "GetTriggeredJobs" }, new { verb = new HttpMethodConstraint("GET") });
         }
 
         // Perform migration tasks to deal with legacy sites that had different file layout

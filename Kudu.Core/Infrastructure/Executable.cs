@@ -322,6 +322,53 @@ namespace Kudu.Core.Infrastructure
             }
         }
 
+        public int ExecuteWithoutIdleManager(ITracer tracer, Action<string> onWriteOutput, Action<string> onWriteError, TimeSpan timeout, string arguments, params object[] args)
+        {
+            using (GetProcessStep(tracer, arguments, args))
+            {
+                Process process = CreateProcess(arguments, args);
+                process.EnableRaisingEvents = true;
+
+                process.OutputDataReceived += (sender, e) =>
+                {
+                    if (e.Data != null)
+                    {
+                        onWriteOutput(e.Data);
+                    }
+                };
+
+                process.ErrorDataReceived += (sender, e) =>
+                {
+                    if (e.Data != null)
+                    {
+                        onWriteError(e.Data);
+                    }
+                };
+
+                process.Start();
+
+                process.BeginErrorReadLine();
+                process.BeginOutputReadLine();
+                process.StandardInput.Close();
+
+                var processStopwatch = Stopwatch.StartNew();
+                while (processStopwatch.Elapsed < timeout && !process.WaitForExit(1000))
+                {
+                    // Placeholder for possible debug breakpoint
+                }
+
+                if (!process.HasExited)
+                {
+                    process.Kill(true, tracer);
+                    throw new TimeoutException("Ending process '{0}:{1}' due to timeout of '{2}'".FormatCurrentCulture(process.ProcessName, process.Id, timeout));
+                }
+
+                tracer.TraceProcessExitCode(process);
+
+                return process.ExitCode;
+            }
+        }
+
         private IDisposable GetProcessStep(ITracer tracer, string arguments, object[] args)
         {
             return tracer.Step("Executing external process", new Dictionary<string, string>
