@@ -6,7 +6,6 @@ using System.IO;
 using System.IO.Abstractions;
 using System.Linq;
 using System.Text;
-using System.Threading;
 using System.Threading.Tasks;
 using Kudu.Contracts.Jobs;
 using Kudu.Contracts.Tracing;
@@ -49,11 +48,39 @@ namespace Kudu.Core.Jobs
             return ListJobs(_environment.TriggeredJobsPaths, BuildTriggeredJob);
         }
 
-        public async Task InvokeTriggeredJob(string name)
+        public AlwaysOnJob GetAlwaysOnJob(string jobName)
         {
+            return GetJob(jobName, _environment.AlwaysOnJobsPaths, BuildAlwaysOnJob);
         }
 
-        private IEnumerable<TJob> ListJobs<TJob>(IEnumerable<string> jobsPaths, Func<DirectoryInfoBase, TJob> buildJobFunc) where TJob : JobBase, new()
+        public TriggeredJob GetTriggeredJob(string jobName)
+        {
+            return GetJob(jobName, _environment.TriggeredJobsPaths, BuildTriggeredJob);
+        }
+
+        public async Task InvokeTriggeredJob(string jobName)
+        {
+            TriggeredJob triggeredJob = GetTriggeredJob(jobName);
+        }
+
+        private TJob GetJob<TJob>(string jobName, IEnumerable<string> jobsPaths, Func<DirectoryInfoBase, TJob> buildJobFunc) where TJob : JobBase, new()
+        {
+            IEnumerable<TJob> jobs = ListJobs(jobsPaths, buildJobFunc, jobName);
+            int jobsCount = jobs.Count();
+            if (jobsCount == 0)
+            {
+                return null;
+            }
+            else if (jobsCount > 1)
+            {
+                // TODO: fix error
+                throw new Exception("Duplicate error");
+            }
+
+            return jobs.First();
+        }
+
+        private IEnumerable<TJob> ListJobs<TJob>(IEnumerable<string> jobsPaths, Func<DirectoryInfoBase, TJob> buildJobFunc, string searchPattern = "*") where TJob : JobBase, new()
         {
             var jobs = new List<TJob>();
 
@@ -65,7 +92,7 @@ namespace Kudu.Core.Jobs
                 }
 
                 DirectoryInfoBase jobsDirectory = _fileSystem.DirectoryInfo.FromDirectoryName(jobsPath);
-                DirectoryInfoBase[] jobDirectories = jobsDirectory.GetDirectories("*", SearchOption.TopDirectoryOnly);
+                DirectoryInfoBase[] jobDirectories = jobsDirectory.GetDirectories(searchPattern, SearchOption.TopDirectoryOnly);
                 foreach (DirectoryInfoBase jobDirectory in jobDirectories)
                 {
                     TJob job = buildJobFunc(jobDirectory);
@@ -137,37 +164,28 @@ namespace Kudu.Core.Jobs
 
             private readonly IEnvironment _environment;
             private readonly IFileSystem _fileSystem;
+            private readonly string _jobName;
 
             private string _jobBinariesPath;
             private string _workingDirectory;
             private string _tempJobPath;
-            private int _lastHash;
+
             private object _cacheLock = new object();
 
-            public TriggeredJob Job { get; private set; }
-
-            public TriggeredJobRunner(TriggeredJob job, IEnvironment environment, IFileSystem fileSystem)
+            public TriggeredJobRunner(string jobName, string jobBinariesPath, IEnvironment environment, IFileSystem fileSystem)
             {
                 _environment = environment;
                 _fileSystem = fileSystem;
+                _jobName = jobName;
+                _jobBinariesPath = jobBinariesPath;
 
-                Job = job;
-
-                _jobBinariesPath = Path.GetDirectoryName(Job.ScriptFilePath);
-                _tempJobPath = Path.Combine(_environment.TempPath, Constants.TriggeredPath, Job.Name);
-
-                if (!_fileSystem.File.Exists(Job.ScriptFilePath))
-                {
-                    //Status = "Missing run_worker.cmd file";
-                    //Trace.TraceError(Status);
-                    //return;
-                }
+                _tempJobPath = Path.Combine(_environment.TempPath, Constants.TriggeredPath, jobName);
             }
 
-            private int CalculateHashForJob()
+            private int CalculateHashForJob(string jobBinariesPath)
             {
                 var updateDatesString = new StringBuilder();
-                DirectoryInfoBase jobBinariesDirectory = _fileSystem.DirectoryInfo.FromDirectoryName(_jobBinariesPath);
+                DirectoryInfoBase jobBinariesDirectory = _fileSystem.DirectoryInfo.FromDirectoryName(jobBinariesPath);
                 FileInfoBase[] files = jobBinariesDirectory.GetFiles("*.*", SearchOption.AllDirectories);
                 foreach (FileInfoBase file in files)
                 {
@@ -181,11 +199,15 @@ namespace Kudu.Core.Jobs
             {
                 lock (_cacheLock)
                 {
-                    var currentHash = CalculateHashForJob();
-
-                    if (_lastHash == currentHash)
+                    if (_workingDirectory != null)
                     {
-                        return;
+                        int currentHash = CalculateHashForJob(_jobBinariesPath);
+                        int lastHash = CalculateHashForJob(_tempJobPath);
+
+                        if (lastHash == currentHash)
+                        {
+                            return;
+                        }
                     }
 
                     SafeKillAllRunningJobInstances(tracer);
@@ -207,8 +229,6 @@ namespace Kudu.Core.Jobs
                         FileSystemHelpers.CopyDirectoryRecursive(_fileSystem, _jobBinariesPath, tempJobInstancePath);
 
                         _workingDirectory = tempJobInstancePath;
-
-                        _lastHash = currentHash;
                     }
                     catch (Exception ex)
                     {
@@ -224,11 +244,18 @@ namespace Kudu.Core.Jobs
 
             public string GetJobEnvironmentKey()
             {
-                return JobEnvironmentKeyPrefix + Job.Name;
+                return JobEnvironmentKeyPrefix + _jobName;
             }
 
-            public async Task RunJobInstance(ITracer tracer)
+            public async Task RunJobInstance(ITracer tracer, TriggeredJob triggeredJob)
             {
+                if (!_fileSystem.File.Exists(Job.ScriptFilePath))
+                {
+                    //Status = "Missing run_worker.cmd file";
+                    //Trace.TraceError(Status);
+                    return;
+                }
+
                 // TODO: Use actual async code
                 await Task.Factory.StartNew(() =>
                 {
@@ -239,14 +266,16 @@ namespace Kudu.Core.Jobs
                         return;
                     }
 
-                    using (tracer.Step("Run script '{0}' with script host - '{1}'".FormatCurrentCulture(Job.ScriptFilePath, Job.ScriptHost.GetType())))
+                    string scriptFileName = Path.GetFileName(triggeredJob.ScriptFilePath);
+
+                    using (tracer.Step("Run script '{0}' with script host - '{1}'".FormatCurrentCulture(scriptFileName, triggeredJob.ScriptHost.GetType())))
                     {
                         try
                         {
-                            var exe = new Executable(Job.ScriptHost.HostPath, _workingDirectory, TimeSpan.MaxValue);
-                            exe.EnvironmentVariables[GetJobEnvironmentKey()] = "true";
+                            var exe = new Executable(triggeredJob.ScriptHost.HostPath, _workingDirectory, TimeSpan.MaxValue);
+                            exe.EnvironmentVariables[GetJobEnvironmentKey(triggeredJob)] = "true";
                             exe.ExecuteWithoutIdleManager(tracer, (message) => tracer.Trace(message), tracer.TraceError, TimeSpan.MaxValue,
-                                                            Job.ScriptHost.ArgumentsFormat, Job.ScriptFilePath);
+                                                            triggeredJob.ScriptHost.ArgumentsFormat, scriptFileName);
                         }
                         catch (Exception ex)
                         {
