@@ -23,6 +23,9 @@ namespace Kudu.Contracts.Jobs
         [DataMember(Name = "url")]
         public Uri Url { get; set; }
 
+        [DataMember(Name = "bin_path")]
+        public string BinariesPath { get; set; }
+
         public IScriptHost ScriptHost { get; set; }
     }
 

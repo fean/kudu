@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
@@ -10,6 +11,7 @@ using System.Threading.Tasks;
 using Kudu.Contracts.Jobs;
 using Kudu.Contracts.Tracing;
 using Kudu.Core.Infrastructure;
+using Kudu.Core.Tracing;
 using Microsoft.Win32;
 
 namespace Kudu.Core.Jobs
@@ -29,11 +31,13 @@ namespace Kudu.Core.Jobs
 
         private readonly IEnvironment _environment;
         private readonly IFileSystem _fileSystem;
-        private readonly ITracer _tracer;
+        private readonly ITraceFactory _traceFactory;
 
-        public JobsManager(ITracer tracer, IEnvironment environment, IFileSystem fileSystem)
+        private readonly ConcurrentDictionary<string, TriggeredJobRunner> _triggeredJobRunners = new ConcurrentDictionary<string, TriggeredJobRunner>(StringComparer.OrdinalIgnoreCase);
+
+        public JobsManager(ITraceFactory traceFactory, IEnvironment environment, IFileSystem fileSystem)
         {
-            _tracer = tracer;
+            _traceFactory = traceFactory;
             _environment = environment;
             _fileSystem = fileSystem;
         }
@@ -60,7 +64,23 @@ namespace Kudu.Core.Jobs
 
         public async Task InvokeTriggeredJob(string jobName)
         {
-            TriggeredJob triggeredJob = GetTriggeredJob(jobName);
+            ITracer tracer = _traceFactory.GetTracer();
+            using (tracer.Step("JobsManager.InvokeTriggeredJob"))
+            {
+                TriggeredJob triggeredJob = GetTriggeredJob(jobName);
+                if (triggeredJob == null)
+                {
+                    // TODO: Create specific exception
+                    throw new FileNotFoundException();
+                }
+
+                TriggeredJobRunner triggeredJobRunner =
+                    _triggeredJobRunners.GetOrAdd(
+                        jobName,
+                        _ => new TriggeredJobRunner(triggeredJob.Name, triggeredJob.BinariesPath, _environment, _fileSystem, _traceFactory));
+
+                await triggeredJobRunner.RunJobInstanceAsync(tracer, triggeredJob);
+            }
         }
 
         private TJob GetJob<TJob>(string jobName, IEnumerable<string> jobsPaths, Func<DirectoryInfoBase, TJob> buildJobFunc) where TJob : JobBase, new()
@@ -132,6 +152,7 @@ namespace Kudu.Core.Jobs
             {
                 Name = jobName,
                 ScriptFilePath = runCommand,
+                BinariesPath = jobDirectory.FullName,
                 ScriptHost = scriptHost
             };
         }
@@ -164,22 +185,30 @@ namespace Kudu.Core.Jobs
 
             private readonly IEnvironment _environment;
             private readonly IFileSystem _fileSystem;
+            private readonly ITraceFactory _traceFactory;
+
             private readonly string _jobName;
+            private readonly string _jobBinariesPath;
+            private readonly string _tempJobPath;
+            private readonly string _dataPath;
+            private readonly LockFile _lockFile;
 
-            private string _jobBinariesPath;
             private string _workingDirectory;
-            private string _tempJobPath;
 
-            private object _cacheLock = new object();
+            private readonly object _cacheLock = new object();
 
-            public TriggeredJobRunner(string jobName, string jobBinariesPath, IEnvironment environment, IFileSystem fileSystem)
+            public TriggeredJobRunner(string jobName, string jobBinariesPath, IEnvironment environment, IFileSystem fileSystem, ITraceFactory traceFactory)
             {
+                _traceFactory = traceFactory;
                 _environment = environment;
                 _fileSystem = fileSystem;
                 _jobName = jobName;
                 _jobBinariesPath = jobBinariesPath;
 
                 _tempJobPath = Path.Combine(_environment.TempPath, Constants.TriggeredPath, jobName);
+                _dataPath = Path.Combine(_environment.TriggeredJobsDataPath, jobName);
+
+                _lockFile = new LockFile(Path.Combine(_dataPath, "triggeredJob.lock"), _traceFactory, _fileSystem);
             }
 
             private int CalculateHashForJob(string jobBinariesPath)
@@ -247,42 +276,63 @@ namespace Kudu.Core.Jobs
                 return JobEnvironmentKeyPrefix + _jobName;
             }
 
-            public async Task RunJobInstance(ITracer tracer, TriggeredJob triggeredJob)
+            public async Task RunJobInstanceAsync(ITracer tracer, TriggeredJob triggeredJob)
             {
-                if (!_fileSystem.File.Exists(Job.ScriptFilePath))
+                if (!String.Equals(_jobName, triggeredJob.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "The job runner can only run jobs with the same name it was configured, configured - {0}, trying to run - {1}".FormatInvariant(_jobName, triggeredJob.Name));
+                }
+
+                if (!_fileSystem.File.Exists(triggeredJob.ScriptFilePath))
                 {
                     //Status = "Missing run_worker.cmd file";
                     //Trace.TraceError(Status);
-                    return;
+                    throw new InvalidOperationException("Missing job script to run - {0}".FormatInvariant(triggeredJob.ScriptFilePath));
                 }
 
-                // TODO: Use actual async code
-                await Task.Factory.StartNew(() =>
+                if (!_lockFile.Lock())
                 {
-                    CacheJobBinaries(tracer);
+                    throw new InvalidOperationException("Job {0} is already running".FormatInvariant(_jobName));
+                }
 
-                    if (_workingDirectory == null)
+                try
+                {
+                    // TODO: Use actual async code
+                    await Task.Factory.StartNew(() =>
                     {
-                        return;
-                    }
+                        CacheJobBinaries(tracer);
 
-                    string scriptFileName = Path.GetFileName(triggeredJob.ScriptFilePath);
+                        if (_workingDirectory == null)
+                        {
+                            return;
+                        }
 
-                    using (tracer.Step("Run script '{0}' with script host - '{1}'".FormatCurrentCulture(scriptFileName, triggeredJob.ScriptHost.GetType())))
-                    {
-                        try
+                        string scriptFileName = Path.GetFileName(triggeredJob.ScriptFilePath);
+
+                        using (tracer.Step("Run script '{0}' with script host - '{1}'".FormatCurrentCulture(scriptFileName, triggeredJob.ScriptHost.GetType())))
                         {
-                            var exe = new Executable(triggeredJob.ScriptHost.HostPath, _workingDirectory, TimeSpan.MaxValue);
-                            exe.EnvironmentVariables[GetJobEnvironmentKey(triggeredJob)] = "true";
-                            exe.ExecuteWithoutIdleManager(tracer, (message) => tracer.Trace(message), tracer.TraceError, TimeSpan.MaxValue,
-                                                            triggeredJob.ScriptHost.ArgumentsFormat, scriptFileName);
+                            try
+                            {
+                                var exe = new Executable(triggeredJob.ScriptHost.HostPath, _workingDirectory, TimeSpan.MaxValue);
+
+                                // Set environment variable to be able to identify all processes spawned for this job
+                                exe.EnvironmentVariables[GetJobEnvironmentKey()] = "true";
+
+                                exe.ExecuteWithoutIdleManager(tracer, (message) => tracer.Trace(message), tracer.TraceError, TimeSpan.MaxValue,
+                                                                triggeredJob.ScriptHost.ArgumentsFormat, scriptFileName);
+                            }
+                            catch (Exception ex)
+                            {
+                                tracer.TraceError(ex);
+                            }
                         }
-                        catch (Exception ex)
-                        {
-                            tracer.TraceError(ex);
-                        }
-                    }
-                });
+                    });
+                }
+                finally
+                {
+                    _lockFile.Release();
+                }
             }
 
             public void SafeKillAllRunningJobInstances(ITracer tracer)
@@ -303,8 +353,7 @@ namespace Kudu.Core.Jobs
                             {
                                 if (!process.HasExited)
                                 {
-                                    tracer.TraceError("Failed to kill process - {0} for job - {1}\n{2}".FormatInvariant(process.ProcessName, Job.Name,
-                                                                                                                        ex));
+                                    tracer.TraceError("Failed to kill process - {0} for job - {1}\n{2}".FormatInvariant(process.ProcessName, _jobName, ex));
                                 }
                             }
                         }
